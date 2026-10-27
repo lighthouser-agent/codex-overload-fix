@@ -47,6 +47,8 @@ Windows自启动尚未适配和实机验证。
 python relay/relay.py --upstream https://cchost.ai/v1 --port 8787 --max-attempts 10
 ```
 
+手动运行必须传`--upstream`。不传时中继沿用上游项目的ChatGPT默认地址。
+
 另一个终端接入配置：
 
 ```powershell
@@ -55,6 +57,7 @@ python scripts/cchost.py status --config C:/path/to/config.toml
 ```
 
 手动模式仅管理配置。中继未启动时，安装器不会把客户端指向该端口。
+在手动模式和自动服务之间切换时重新安装。卸载按最近一次安装的模式决定是否停止服务。
 卸载先恢复配置，再关闭运行中继的终端。
 
 ## 查看运行状态
@@ -75,6 +78,10 @@ python3 scripts/cchost.py status
 | macOS | LaunchAgent为`com.cchost.codex-retry`，日志在`~/Library/Application Support/cchost-codex-retry/` |
 | Linux | systemd用户服务为`cchost-codex-retry.service`，日志在`$XDG_STATE_HOME/cchost-codex-retry/`，未设置时使用`~/.local/state/` |
 
+中继日志写入`relay.log`，按8MB轮换。
+macOS的`service.log`只接收无法写入`relay.log`的行和Python异常输出。
+Linux的同类输出进入systemd日志。
+
 日志中的`retryable`表示中继正在重试，`giving up`表示重试预算耗尽。
 `stream committed`后的方括号是放行时的事件形态，`stream ended`记录放行后的结束事件。
 放行后出现`failure`，说明错误发生在可见输出之后，中继不会重放。
@@ -84,6 +91,7 @@ Orca的自动继续由现有容量巡检提供，本仓库不安装该巡检。
 Linux服务默认随用户登录启动。只用SSH登录且需要登出后继续运行时，先在目标机器配置`loginctl enable-linger 用户名`。
 每台机器的自动服务只用于一份受管CCHost配置。切换配置或端口前先卸载，避免多个配置共用同一个服务后互相停用。
 旧版安装器使用另一个服务名，也监听8787。使用团队入口前，先用对应旧版卸载脚本撤回旧服务。
+端口已被手动中继或其他进程占用时，安装器拒绝注册服务。先关闭它，或换端口，或改用`--manual`。
 
 安装失败会恢复之前的服务定义；首次安装失败会移除本次注册的服务。
 配置写入失败也会回滚本次服务改动，原配置保留。
@@ -104,6 +112,7 @@ python3 scripts/cchost.py uninstall
 自动测试覆盖模拟过载、重试耗尽、错误分类、输出后不重放和取消。
 配置测试覆盖认证保留、重复安装、并发修改检测和卸载恢复。
 SSE的嵌套错误和顶层错误都支持识别。
+HTTP错误和SSE错误共用额度、计费和认证判断。判断按完整词匹配，`load-balanced`不会被当成余额错误。
 CCHost有时把SSE标为`text/plain`，或省略Content-Type。
 这两种情况会根据正文开头识别SSE。
 正文不是SSE时直接转发，保留原响应头。

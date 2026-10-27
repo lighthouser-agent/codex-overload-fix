@@ -78,9 +78,20 @@ def service_definition(port, upstream, proxy):
     return file, state, unit.encode()
 
 
+def stop_launchd():
+    target = f"gui/{os.getuid()}/{LABEL}"
+    run(["launchctl", "bootout", target], required=False)
+    # bootout can return before launchd drops the job, and bootstrap fails until it does.
+    deadline = time.monotonic() + 10
+    while run(["launchctl", "print", target], required=False):
+        if time.monotonic() >= deadline:
+            raise ValueError("launchd service is still running")
+        time.sleep(0.2)
+
+
 def activate(file):
     if platform.system() == "Darwin":
-        run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], required=False)
+        stop_launchd()
         run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(file)])
     else:
         run(["systemctl", "--user", "daemon-reload"])
@@ -131,9 +142,7 @@ def install(port, upstream, proxy=""):
 def uninstall():
     file, _ = paths()
     if platform.system() == "Darwin":
-        run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], required=False)
-        if run(["launchctl", "print", f"gui/{os.getuid()}/{LABEL}"], required=False):
-            raise ValueError("launchd service is still running")
+        stop_launchd()
     else:
         run(["systemctl", "--user", "disable", "--now", SERVICE], required=False)
         if run(["systemctl", "--user", "is-active", "--quiet", SERVICE], required=False):

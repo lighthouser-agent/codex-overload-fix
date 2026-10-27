@@ -1,14 +1,17 @@
 import gzip
+import http.client
 import json
 import sys
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from tests.harness import OVERLOAD, ROOT, SUCCESS, Relay, event, sse
 
 sys.path.insert(0, str(ROOT / "relay"))
-from sse import SSEHead, SSETail, StreamAttempt, classify_event, describe
+from sse import SSEHead, SSETail, StreamAttempt, classify_event, describe, is_denied
 
 
 class FramingTests(unittest.TestCase):
@@ -48,6 +51,25 @@ class FramingTests(unittest.TestCase):
             tail.feed(SUCCESS)
             self.assertEqual((tail.stopped, tail.last), (True, "untracked"))
         self.assertEqual(describe(b'{"type":"x y","secret value":"private"}'), "type=? keys=?,type")
+
+    def test_denials_match_whole_words_only(self):
+        for error in ({"code": "insufficient_quota"}, {"type": "billing_hard_limit_reached"},
+                      {"code": "invalid_api_key"}, {"message": "余额不足"}, "insufficient credits"):
+            with self.subTest(error=error):
+                self.assertTrue(is_denied(error))
+        self.assertFalse(is_denied({"code": "server_is_overloaded",
+                                    "message": "All load-balanced upstream channels are overloaded"}))
+
+    def test_deadline_abort_and_commit_exclude_each_other(self):
+        with StreamAttempt(lambda timeout: Mock(), 1, time.monotonic() + 0.05, lambda: False) as attempt:
+            attempt._commit()
+            time.sleep(0.2)
+            self.assertIsNone(attempt.abort_reason)
+        with StreamAttempt(lambda timeout: Mock(), 1, time.monotonic() + 0.05, lambda: False) as attempt:
+            time.sleep(0.2)
+            with self.assertRaisesRegex(OSError, "deadline"):
+                attempt._commit()
+            self.assertFalse(attempt.committed)
 
     def test_connect_failure_can_retry_without_sending_request_bytes(self):
         connection = Mock()
@@ -253,6 +275,29 @@ class CCHostCaptureTests(unittest.TestCase):
             logs = relay.output.read_text()
             for secret in ("private-metadata", "private-error-text", "resp_fixture", "private-output"):
                 self.assertNotIn(secret, logs)
+
+    def test_http_overload_mentioning_load_balancing_retries(self):
+        body = json.dumps({"error": {"code": "server_is_overloaded",
+                                     "message": "All load-balanced upstream channels are overloaded"}}).encode()
+        with Relay([(503, {"Content-Type": "application/json"}, [body]), sse(SUCCESS)]) as relay:
+            self.assertEqual(relay.request()[2], SUCCESS)
+            self.assertEqual(len(relay.server.requests), 2)
+
+    def test_default_upstream_stays_chatgpt_for_legacy_installers(self):
+        with Relay([], upstream=False) as relay:
+            connection = http.client.HTTPConnection("127.0.0.1", relay.port, timeout=5)
+            connection.request("GET", "/__codex_retry/health")
+            health = json.loads(connection.getresponse().read())
+            connection.close()
+        self.assertEqual(health["upstream"], "https://chatgpt.com/backend-api/codex")
+
+    def test_log_file_is_not_duplicated_on_stdout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "relay.log"
+            with Relay([sse(SUCCESS)], "--log", str(path)) as relay:
+                self.assertEqual(relay.request()[2], SUCCESS)
+                self.assertIn("POST /responses", path.read_text())
+                self.assertNotIn("POST /responses", relay.output.read_text())
 
     def test_committed_stream_end_is_logged_without_content(self):
         error = {"code": "server_is_overloaded", "message": "private-error-text"}

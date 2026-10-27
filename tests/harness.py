@@ -64,7 +64,7 @@ def sse(*chunks):
 class Relay:
     """Own exactly the server and subprocess created for one test."""
 
-    def __init__(self, replies, *extra):
+    def __init__(self, replies, *extra, upstream=True):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
         self.server.daemon_threads = True
         self.server.replies = replies
@@ -79,8 +79,8 @@ class Relay:
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             self.port = probe.getsockname()[1]
-        argv = [sys.executable, str(ROOT / "relay/relay.py"), "--port", str(self.port),
-                "--upstream", f"http://127.0.0.1:{self.server.server_port}/v1",
+        target = ["--upstream", f"http://127.0.0.1:{self.server.server_port}/v1"] if upstream else []
+        argv = [sys.executable, str(ROOT / "relay/relay.py"), "--port", str(self.port), *target,
                 "--max-attempts", "3", "--backoff-base", "0.01", "--backoff-max", "0.01",
                 "--total-budget", "3", "--timeout", "3", *extra]
         with self.output.open("wb") as output:

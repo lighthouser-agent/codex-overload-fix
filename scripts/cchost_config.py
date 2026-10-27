@@ -142,6 +142,9 @@ def apply(config, original, candidate, state):
     if config.read_bytes() != original.encode("utf-8"):
         raise ValueError("config changed during installation; no write performed")
     if original == candidate:
+        # A reinstall leaves the config alone but may switch between manual and service mode.
+        if state_path(config).exists():
+            atomic_write(state_path(config), (json.dumps(state, indent=2) + "\n").encode())
         return
     atomic_write(Path(state["backup"]), original.encode("utf-8"))
     atomic_write(state_path(config), (json.dumps(state, indent=2) + "\n").encode())

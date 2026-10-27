@@ -27,14 +27,16 @@ def install(args, path):
     if not args.manual:
         with socket.socket() as probe:
             occupied = probe.connect_ex(("127.0.0.1", args.port)) == 0
-        if occupied and not service.health(args.port, state["upstream"]):
-            raise ValueError("port occupied by another service; choose --port")
         previous_service = service.snapshot()
+        # A healthy relay with no managed service is a manual one; the service could not bind the port.
+        if occupied and (previous_service is None or not service.health(args.port, state["upstream"])):
+            raise ValueError("port held by a process this installer does not manage; "
+                             "stop it, choose --port or use --manual")
         service.install(args.port, state["upstream"], args.proxy)
     elif not service.health(args.port, state["upstream"]):
         raise ValueError("start relay/relay.py first; refusing to point Codex at an unavailable relay")
-    if original != candidate:
-        state["manual"] = args.manual
+    # Persist the mode on every install so uninstall knows whether a service is ours to stop.
+    state["manual"] = args.manual
     try:
         config.apply(path, original, candidate, state)
     except (OSError, ValueError) as exc:

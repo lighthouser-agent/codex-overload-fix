@@ -17,10 +17,9 @@ OVERLOAD_CODES = {
 }
 # response.metadata carries ids only; CCHost sends it right before an in-stream overload.
 SETUP_EVENTS = {"response.created", "response.in_progress", "response.queued", "response.metadata", "ping"}
-QUOTA_MARKERS = (
-    "quota", "billing", "credit", "balance", "invalid_api_key", "authentication",
-    "unauthorized", "余额", "额度", "欠费",
-)
+# Whole words after _ - . become spaces, so insufficient_quota matches but load-balanced does not.
+DENIAL_WORDS = re.compile(r"\b(quota|billing|credits?|balance|invalid api key|authentication|unauthorized)\b")
+DENIAL_CJK = ("余额", "额度", "欠费")
 TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
 
@@ -54,12 +53,20 @@ def describe(payload):
     return " ".join(parts)
 
 
-def is_overload(error):
+def is_denied(error):
+    """Quota, billing and auth denials never retry; HTTP and SSE errors share this check."""
+    if isinstance(error, str):
+        error = {"message": error}
     if not isinstance(error, dict):
         return False
-    values = [str(error.get(key) or "").lower() for key in ("code", "type", "message")]
-    if any(marker in value for marker in QUOTA_MARKERS for value in values):
+    text = " ".join(str(error.get(key) or "") for key in ("code", "type", "message")).lower()
+    return bool(DENIAL_WORDS.search(re.sub(r"[_.-]", " ", text))) or any(word in text for word in DENIAL_CJK)
+
+
+def is_overload(error):
+    if not isinstance(error, dict) or is_denied(error):
         return False
+    values = [str(error.get(key) or "").lower() for key in ("code", "type", "message")]
     return any(value in OVERLOAD_CODES for value in values[:2]) or any(
         marker in values[2] for marker in ("at capacity", "overloaded")
     )
@@ -225,6 +232,8 @@ class StreamAttempt:
         self.sock = None
         self.committed = False
         self.abort_reason = None
+        # Orders the deadline abort against commit so a committed stream is never cut.
+        self.lock = threading.Lock()
         self.done = threading.Event()
         self.watcher = threading.Thread(target=self._watch, daemon=True)
 
@@ -241,10 +250,11 @@ class StreamAttempt:
 
     def _watch(self):
         while not self.done.wait(0.05):
-            if self.client_gone():
-                self.abort_reason = "client_closed"
-            elif not self.committed and time.monotonic() >= self.deadline:
-                self.abort_reason = "deadline"
+            with self.lock:
+                if self.client_gone():
+                    self.abort_reason = "client_closed"
+                elif not self.committed and time.monotonic() >= self.deadline:
+                    self.abort_reason = "deadline"
             if not self.abort_reason:
                 continue
             sock = self.sock or self.conn.sock
@@ -287,7 +297,10 @@ class StreamAttempt:
                           b"relay: upstream transport interrupted\n", reason)
 
     def _commit(self):
-        self.committed = True
+        with self.lock:
+            if self.abort_reason:
+                raise OSError(self.abort_reason)
+            self.committed = True
         if self.sock:
             self.sock.settimeout(self.timeout)
 
@@ -299,8 +312,7 @@ class StreamAttempt:
             error = document.get("error", document) if isinstance(document, dict) else {}
         except ValueError:
             error = {}
-        denied = any(marker in str(error).lower() for marker in QUOTA_MARKERS)
-        transient = status in (500, 502, 503, 504) and not denied
+        transient = status in (500, 502, 503, 504) and not is_denied(error)
         limited = status == 429 and is_overload(error)
         mode = "retry" if transient or limited else "passthrough"
         return Result(mode, status, headers, body, f"http_{status}", retry_after(self.response.headers))

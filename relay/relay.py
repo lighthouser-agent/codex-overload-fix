@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Local retry relay for Codex /responses.
 
-Listens on http://127.0.0.1:<port> and forwards to
-https://cchost.ai/v1, retrying when the upstream answers
-with a server-overload ("Selected model is at capacity") response instead of
-handing that failure straight to Codex.
+Listens on http://127.0.0.1:<port> and forwards to --upstream, retrying when
+the upstream answers with a server-overload ("Selected model is at capacity")
+response instead of handing that failure straight to Codex. The default
+upstream stays ChatGPT for the legacy installers; scripts/cchost.py passes the
+CCHost URL explicitly.
 
 Everything is byte-transparent: request bodies (including zstd-compressed
 ones) and auth headers are forwarded untouched. Only the very start of the
@@ -47,7 +48,6 @@ LOG_MAX = 8 * 1024 * 1024
 def log(msg):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
     with LOG_LOCK:
-        print(line, flush=True)
         if ARGS.log:
             try:
                 if LOG_SIZE[0] > LOG_MAX:
@@ -56,8 +56,11 @@ def log(msg):
                 with open(ARGS.log, "a", encoding="utf-8") as f:
                     f.write(line + "\n")
                 LOG_SIZE[0] += len(line) + 1
+                return
             except OSError:
                 pass
+        # Services capture stdout without rotation, so it only carries lines the log file could not.
+        print(line, flush=True)
 
 
 ARGS = None
@@ -253,7 +256,7 @@ def main():
     global ARGS
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8787)
-    p.add_argument("--upstream", default="https://cchost.ai/v1")
+    p.add_argument("--upstream", default="https://chatgpt.com/backend-api/codex")
     p.add_argument("--proxy", default="", help="e.g. http://127.0.0.1:7897")
     p.add_argument("--max-attempts", type=int, default=10)
     p.add_argument("--total-budget", type=float, default=300.0)
