@@ -78,8 +78,12 @@ def service_definition(port, upstream, proxy):
     return file, state, unit.encode()
 
 
+def domain():
+    return f"gui/{os.getuid()}"
+
+
 def stop_launchd():
-    target = f"gui/{os.getuid()}/{LABEL}"
+    target = f"{domain()}/{LABEL}"
     run(["launchctl", "bootout", target], required=False)
     # bootout can return before launchd drops the job, and bootstrap fails until it does.
     deadline = time.monotonic() + 10
@@ -92,7 +96,7 @@ def stop_launchd():
 def activate(file):
     if platform.system() == "Darwin":
         stop_launchd()
-        run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(file)])
+        run(["launchctl", "bootstrap", domain(), str(file)])
     else:
         run(["systemctl", "--user", "daemon-reload"])
         run(["systemctl", "--user", "enable", SERVICE])

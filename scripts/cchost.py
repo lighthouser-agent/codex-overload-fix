@@ -93,4 +93,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # A Windows pipe using cp1252 cannot encode the Chinese messages; escape them instead of crashing.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     main()

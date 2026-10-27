@@ -19,6 +19,7 @@ import os
 import random
 import select
 import socket
+import socketserver
 import sys
 import threading
 import time
@@ -240,6 +241,16 @@ class Handler(BaseHTTPRequestHandler):
     do_PATCH = _proxy
 
 
+class LoopbackServer(ThreadingHTTPServer):
+    """Bind without HTTPServer's getfqdn, a reverse DNS lookup that can stall startup."""
+
+    daemon_threads = True
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def parse_upstream(value):
     parsed = urlsplit(value if "://" in value else "https://" + value)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -286,8 +297,7 @@ def main():
         ARGS.proxy = (proxy.hostname, proxy.port or 80)
 
     log(f"relay listening on 127.0.0.1:{ARGS.port} upstream={ARGS.upstream_host}")
-    srv = ThreadingHTTPServer(("127.0.0.1", ARGS.port), Handler)
-    srv.daemon_threads = True
+    srv = LoopbackServer(("127.0.0.1", ARGS.port), Handler)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

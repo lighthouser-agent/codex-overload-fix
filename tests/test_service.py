@@ -26,8 +26,12 @@ class ServiceTests(unittest.TestCase):
         self.file = self.root / "relay.plist"
         self.paths = patch.object(service, "paths", return_value=(self.file, self.root / "logs"))
         self.paths.start()
+        # launchd paths are exercised on every OS; Windows has no getuid.
+        self.domain = patch.object(service, "domain", return_value="gui/501")
+        self.domain.start()
 
     def tearDown(self):
+        self.domain.stop()
         self.paths.stop()
         self.directory.cleanup()
 

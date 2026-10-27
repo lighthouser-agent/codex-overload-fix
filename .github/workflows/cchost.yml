@@ -23,6 +23,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # Temporary: confirms whether getfqdn stalled macOS relay startup; remove once CI shows the timing.
+      - name: Time the reverse DNS lookup HTTPServer does on bind
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import socket, time
+          for attempt in (1, 2):
+              start = time.monotonic()
+              name = socket.getfqdn("127.0.0.1")
+              print(f"getfqdn attempt {attempt}: {name} in {time.monotonic() - start:.2f}s")
+          PY
       - run: python -m unittest discover -s tests -t . -v
 
   native-service:
@@ -65,3 +77,17 @@ jobs:
                       run('uninstall')
               assert tomllib.loads(path.read_text()) == tomllib.loads(original)
           PY
+      - name: Service logs
+        if: failure()
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            D="$HOME/Library/Application Support/cchost-codex-retry"
+          else
+            export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+            D="${XDG_STATE_HOME:-$HOME/.local/state}/cchost-codex-retry"
+            journalctl --user -u cchost-codex-retry.service --no-pager | tail -50 || echo "journalctl failed: $?"
+          fi
+          for f in service.log relay.log; do
+            if [ -f "$D/$f" ]; then echo "--- $f"; cat "$D/$f"; else echo "--- $f missing"; fi
+          done

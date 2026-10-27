@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import socket
+import socketserver
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,16 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+class LoopbackServer(ThreadingHTTPServer):
+    """Mirror relay.LoopbackServer: skip getfqdn, which can stall binding on CI runners."""
+
+    daemon_threads = True
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def event(kind, **values):
@@ -65,8 +76,10 @@ class Relay:
     """Own exactly the server and subprocess created for one test."""
 
     def __init__(self, replies, *extra, upstream=True):
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
-        self.server.daemon_threads = True
+        self.process = None
+        self.directory = tempfile.TemporaryDirectory()
+        self.output = Path(self.directory.name) / "relay-output.txt"
+        self.server = LoopbackServer(("127.0.0.1", 0), FakeUpstream)
         self.server.replies = replies
         self.server.requests = []
         self.server.lock = threading.Lock()
@@ -74,8 +87,13 @@ class Relay:
         self.server.disconnected = threading.Event()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
-        self.directory = tempfile.TemporaryDirectory()
-        self.output = Path(self.directory.name) / "relay-output.txt"
+        try:
+            self._start(extra, upstream)
+        except BaseException:
+            self.__exit__()
+            raise
+
+    def _start(self, extra, upstream):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             self.port = probe.getsockname()[1]
@@ -95,9 +113,9 @@ class Relay:
                     return
             except OSError:
                 if self.process.poll() is not None:
-                    raise RuntimeError(self.output.read_text())
+                    raise RuntimeError(self.output.read_text(errors="replace"))
                 time.sleep(0.02)
-        raise TimeoutError("relay did not listen")
+        raise TimeoutError("relay did not listen; output: " + self.output.read_text(errors="replace")[-2000:])
 
     def request(self, body=b'{"model":"test-model","stream":true}', path="/responses", headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -118,7 +136,7 @@ class Relay:
         return self
 
     def __exit__(self, *unused):
-        if self.process.poll() is None:
+        if self.process and self.process.poll() is None:
             if os.name == "posix":
                 command = subprocess.check_output(["ps", "-p", str(self.process.pid), "-o", "command="], text=True)
                 assert str(ROOT / "relay/relay.py") in command
