@@ -154,7 +154,8 @@ class RelayTests(unittest.TestCase):
         for changed in ({"content": [{"type": "output_text", "text": "private-output"}]},
                         {"phase": "future-phase"}, {"unknown": "private-output"}):
             first = event("response.output_item.added", item={**item, **changed})
-            with self.subTest(changed=changed), Relay([sse(first, OVERLOAD)]) as relay:
+            # CCHost mode: the default upstream drop makes the forwarded tail depend on read timing.
+            with self.subTest(changed=changed), Relay([sse(first, OVERLOAD)], "--forward-late-overload") as relay:
                 self.assertEqual(relay.request()[2], first + OVERLOAD)
                 self.assertEqual(len(relay.server.requests), 1)
 
@@ -207,7 +208,8 @@ class RelayTests(unittest.TestCase):
                  "response.output_item.added", "response.function_call_arguments.delta")
         for kind in kinds:
             first = event(kind, delta="private-output")
-            with self.subTest(kind=kind), Relay([sse(first, OVERLOAD)]) as relay:
+            # CCHost mode: the default upstream drop makes the forwarded tail depend on read timing.
+            with self.subTest(kind=kind), Relay([sse(first, OVERLOAD)], "--forward-late-overload") as relay:
                 self.assertEqual(relay.request()[2], first + OVERLOAD)
                 self.assertEqual(len(relay.server.requests), 1)
 
