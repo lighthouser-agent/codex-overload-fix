@@ -29,3 +29,6 @@ desktop.ini
 # a zip sitting in the working tree is never the artefact of record.
 codex-overload-fix-*.zip
 codex-overload-fix-*.zip.sha256
+
+# Local execution records contain workstation paths and remain on this machine.
+thinking/

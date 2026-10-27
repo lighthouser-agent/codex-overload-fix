@@ -1,0 +1,67 @@
+name: CCHost relay
+
+on:
+  push:
+    paths: ['relay/**', 'scripts/cchost*.py', 'tests/**', '.github/workflows/cchost.yml']
+  pull_request:
+    paths: ['relay/**', 'scripts/cchost*.py', 'tests/**', '.github/workflows/cchost.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m unittest discover -s tests -t . -v
+
+  native-service:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install, inspect and restore a simulated CCHost config
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          fi
+          python - <<'PY'
+          import subprocess
+          import sys
+          import tempfile
+          import tomllib
+          from pathlib import Path
+          original = 'model_provider = "cchost"\n[model_providers.cchost]\nbase_url = "https://cchost.ai/v1"\nwire_api = "responses"\n'
+          with tempfile.TemporaryDirectory() as directory:
+              path = Path(directory).resolve() / 'config.toml'
+              path.write_text(original)
+              def run(action, *flags):
+                  subprocess.run([sys.executable, 'scripts/cchost.py', action, '--config', str(path), *flags], check=True)
+              try:
+                  run('install', '--dry-run')
+                  run('install')
+                  run('install')
+                  run('status')
+              finally:
+                  if path.with_name('config.toml.cchost-retry.json').exists():
+                      run('uninstall')
+              assert tomllib.loads(path.read_text()) == tomllib.loads(original)
+          PY

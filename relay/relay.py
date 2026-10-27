@@ -2,7 +2,7 @@
 """Local retry relay for Codex /responses.
 
 Listens on http://127.0.0.1:<port> and forwards to
-https://chatgpt.com/backend-api/codex, retrying when the upstream answers
+https://cchost.ai/v1, retrying when the upstream answers
 with a server-overload ("Selected model is at capacity") response instead of
 handing that failure straight to Codex.
 
@@ -12,7 +12,6 @@ SSE stream is inspected to decide whether the attempt succeeded.
 """
 
 import argparse
-import gzip
 import http.client
 import json
 import os
@@ -22,8 +21,10 @@ import socket
 import sys
 import threading
 import time
-import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+from sse import SSETail, StreamAttempt
 
 HOP_BY_HOP = {
     "connection",
@@ -37,26 +38,6 @@ HOP_BY_HOP = {
     "content-length",
     "accept-encoding",
 }
-
-OVERLOAD_CODES = {
-    "server_overloaded",      # response.failed / response.error
-    "server_is_overloaded",   # bare {"type":"error"} event (observed on real traffic)
-    "service_unavailable_error",
-    "flex_unavailable",
-    "queue_full",
-}
-
-
-def is_overload(err):
-    code = (err.get("code") or "").lower()
-    etype = (err.get("type") or "").lower()
-    msg = (err.get("message") or "").lower()
-    return (
-        code in OVERLOAD_CODES
-        or etype in OVERLOAD_CODES
-        or "at capacity" in msg
-        or "overloaded" in msg
-    )
 
 LOG_LOCK = threading.Lock()
 LOG_SIZE = [0]
@@ -114,317 +95,137 @@ def read_request_body(handler):
     return handler.rfile.read(length) if length else b""
 
 
+def clean_headers(headers):
+    blocked = set(HOP_BY_HOP)
+    for key, value in headers.items():
+        if key.lower() == "connection":
+            blocked.update(part.strip().lower() for part in value.split(","))
+    return {key: value for key, value in headers.items() if key.lower() not in blocked}
+
+
 def forward_headers(handler):
-    out = {}
-    for k, v in handler.headers.items():
-        if k.lower() in HOP_BY_HOP:
-            continue
-        out[k] = v
-    out["Host"] = ARGS.upstream_host
+    out = clean_headers(handler.headers)
     out["Accept-Encoding"] = "identity"
     return out
 
 
-def classify_event(payload):
-    """Return ('retry'|'commit'|None, info)."""
-    try:
-        evt = json.loads(payload)
-    except (ValueError, TypeError):
-        return None, None
-    kind = evt.get("type")
-    if kind == "response.failed":
-        err = (evt.get("response") or {}).get("error") or {}
-        code = err.get("code") or ""
-        msg = err.get("message") or ""
-        if is_overload(err):
-            return "retry", f"{code or 'overload'}: {msg[:60]}"
-        return "commit", f"non-retryable failure {code}"
-    if kind in (
-        "response.output_text.delta",
-        "response.reasoning_summary_text.delta",
-        "response.output_item.done",
-        "response.completed",
-        "response.incomplete",
-    ):
-        return "commit", kind
-    if kind == "error":
-        err = evt.get("error") or {}
-        if is_overload(err):
-            return "retry", f"error event overload: {(err.get('code') or err.get('type') or '')}"
-        return "commit", "error event"
-    return None, None
-
-
-def attempt(path, headers, body, timeout, commit_by):
-    """One upstream attempt.
-
-    Returns (mode, status, resp_headers, prelude, conn, resp)
-    mode in {"stream", "retry", "passthrough"}
-    """
-    conn = upstream_connection(timeout)
-    try:
-        conn.request("POST", path, body=body, headers=headers)
-        resp = conn.getresponse()
-    except Exception as exc:  # noqa: BLE001 - network failures are retryable
-        return "retry", 0, {}, b"", None, f"connect/read error: {exc!r}"
-
-    if resp.status != 200:
-        data = b""
-        try:
-            data = resp.read()
-        except Exception:  # noqa: BLE001
-            pass
-        conn.close()
-        status = resp.status
-        if status in (429, 500, 502, 503, 504):
-            return "retry", status, {}, data, None, f"http {status}"
-        return "passthrough", status, dict(resp.getheaders()), data, None, ""
-
-    prelude = bytearray()
-    buf = b""
-    seen = 0
-    while True:
-        try:
-            chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
-        except Exception as exc:  # noqa: BLE001
-            conn.close()
-            return "retry", 0, {}, bytes(prelude), None, f"stream error: {exc!r}"
-        if not chunk:
-            conn.close()
-            return "retry", 0, {}, bytes(prelude), None, "stream ended early"
-        prelude.extend(chunk)
-        buf += chunk
-        # Only need the head of the stream to make the call.
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            line = line.strip()
-            if not line.startswith(b"data:"):
-                continue
-            payload = line[5:].strip()
-            if not payload or payload == b"[DONE]":
-                continue
-            seen += 1
-            if seen <= 12:
-                try:
-                    _ev = json.loads(payload)
-                    _t = _ev.get("type")
-                except (ValueError, TypeError):
-                    _ev, _t = {}, "?"
-                _served = (_ev.get("response") or {}).get("model") if _ev else None
-                _tag = f"[served={_served}] " if _served else ""
-                log(f"  evt#{seen} {_t} {_tag}{payload[:200]!r}")
-            verdict, info = classify_event(payload)
-            if verdict == "retry":
-                conn.close()
-                return "retry", 200, {}, bytes(prelude), None, info or "overload"
-            if verdict == "commit":
-                return "stream", 200, dict(resp.getheaders()), bytes(prelude), conn, resp
-        if len(prelude) > 262144:
-            # Nothing conclusive after 256 KiB - assume it is a real stream.
-            return "stream", 200, dict(resp.getheaders()), bytes(prelude), conn, resp
-        if time.time() >= commit_by:
-            # Held the head back long enough; stop delaying the client.
-            return "stream", 200, dict(resp.getheaders()), bytes(prelude), conn, resp
-
-
-def analyze(handler, body):
-    """One-line size breakdown of a /responses body. Sizes only, no content."""
-    if len(body) > 64 << 20:
-        return f" | analyze-skipped({len(body)}B too large)"
-    enc = (handler.headers.get("Content-Encoding") or "").lower()
-    try:
-        if enc in ("", "identity"):
-            raw = body
-        elif enc == "gzip":
-            raw = gzip.decompress(body)
-        elif enc == "deflate":
-            raw = zlib.decompress(body)
-        elif enc == "zstd":
-            try:
-                from compression import zstd
-                raw = zstd.decompress(body)
-            except Exception:
-                import zstandard
-                raw = zstandard.ZstdDecompressor().decompress(body, max_output_size=64 << 20)
-        else:
-            return f" enc={enc} analysis-skipped"
-        doc = json.loads(raw)
-    except Exception as exc:  # noqa: BLE001
-        return f" analyze-failed({exc.__class__.__name__})"
-
-    parts = []
-    if doc.get("model"):
-        parts.append(f"model={doc['model']}")
-    _r = doc.get("reasoning") or {}
-    if isinstance(_r, dict) and _r.get("effort"):
-        parts.append(f"effort={_r['effort']}")
-    if doc.get("service_tier"):
-        parts.append(f"tier={doc['service_tier']}")
-    if isinstance(doc.get("instructions"), str):
-        parts.append(f"instructions={len(doc['instructions'])}c")
-    tools = doc.get("tools") or []
-    if tools:
-        tb = len(json.dumps(tools, ensure_ascii=False).encode())
-        parts.append(f"tools={tb}B/{len(tools)}")
-    items = doc.get("input") or []
-    if isinstance(items, list):
-        by = {}
-        for it in items:
-            role = it.get("type") or "?"
-            if role == "message":
-                role = "msg:" + (it.get("role") or "?")
-            b = len(json.dumps(it, ensure_ascii=False).encode())
-            by[role] = by.get(role, 0) + b
-        top = ",".join(f"{k}={v}" for k, v in sorted(by.items(), key=lambda kv: -kv[1])[:4])
-        parts.append(f"input={len(json.dumps(items, ensure_ascii=False).encode())}B/{len(items)}it({top})")
-    if doc.get("prompt_cache_key"):
-        parts.append("cache_key=yes")
-    return " | " + (" ".join(parts) if parts else "empty")
-
-
 class Handler(BaseHTTPRequestHandler):
+    """Forward requests; retry only confirmed overload before observable output."""
+
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt, *args):  # silence default stderr logging
+    def log_message(self, fmt, *args):
         pass
 
     def _proxy(self):
-        path = self.path
-        upstream_path = ARGS.upstream_prefix + path
-        body = read_request_body(self)
-        headers = forward_headers(self)
-
-        is_responses = self.command == "POST" and path.split("?")[0].endswith("/responses")
-        if not is_responses:
-            self._passthrough(upstream_path, headers, body)
+        if self.command == "GET" and self.path == "/__codex_retry/health":
+            body = json.dumps({"service": "cchost-codex-retry", "upstream": ARGS.upstream}).encode()
+            self._send_simple(200, {"Content-Type": "application/json"}, body)
             return
+        try:
+            body = read_request_body(self)
+        except (OSError, ValueError):
+            self._send_simple(400, {"Content-Type": "text/plain"}, b"relay: invalid request body\n")
+            return
+        headers = forward_headers(self)
+        path = ARGS.upstream_prefix + self.path
+        if self.command == "POST" and self.path.split("?")[0].rstrip("/") == "/responses":
+            self._retry_responses(path, headers, body)
+        else:
+            self._passthrough(path, headers, body)
 
-        cport = self.client_address[1]
-        log(f"[{cport}] {self.command} {path} ({len(body)}B){analyze(self, body)}")
-        deadline = time.time() + ARGS.total_budget
-        attempt_no = 0
-        last = None
-        while True:
+    def _retry_responses(self, path, headers, body):
+        port = self.client_address[1]
+        log(f"[{port}] POST /responses ({len(body)}B)")
+        deadline = time.monotonic() + ARGS.total_budget
+        for number in range(1, ARGS.max_attempts + 1):
             if self._client_gone():
-                # Codex cancelled the turn or exited; stop burning upstream quota.
-                log(f"abandoning retries after {attempt_no} attempts (client gone)")
                 return
-            attempt_no += 1
-            mode, status, resp_headers, prelude, conn, resp = attempt(
-                upstream_path, headers, body, ARGS.timeout,
-                time.time() + ARGS.commit_deadline,
-            )
-            if mode == "stream":
-                log(f"[{cport}] attempt {attempt_no}: ok, streaming")
-                self._stream_back(resp_headers, prelude, conn, resp)
+            commit_by = min(deadline, time.monotonic() + ARGS.commit_deadline)
+            with StreamAttempt(upstream_connection, ARGS.timeout, commit_by, self._client_gone) as attempt:
+                result = attempt.run(path, headers, body)
+                if attempt.abort_reason == "client_closed":
+                    log(f"[{port}] client cancelled")
+                    return
+                if result.mode == "stream":
+                    log(f"[{port}] attempt {number}: stream committed ({result.reason}); "
+                        f"forwarding [{result.detail}]")
+                    self._stream_back(result, attempt.response, port)
+                    return
+            if result.mode != "retry":
+                log(f"[{port}] attempt {number}: upstream {result.status}, passthrough")
+                self._send_simple(result.status, result.headers, result.body)
                 return
-            if mode == "passthrough":
-                log(f"[{cport}] attempt {attempt_no}: upstream {status}, passthrough")
-                self._send_simple(status, resp_headers, prelude)
+            log(f"[{port}] attempt {number}: retryable ({result.reason}) [{result.detail}]")
+            delay = min(ARGS.backoff_max, ARGS.backoff_base * 1.6 ** min(number - 1, 30))
+            delay = max(result.delay, delay * random.uniform(0.7, 1.3))
+            if number == ARGS.max_attempts or time.monotonic() + delay >= deadline:
+                log(f"[{port}] giving up after {number} attempts")
+                self._send_simple(result.status, result.headers, result.body)
                 return
-            last = (status, prelude, resp)
-            log(f"[{cport}] attempt {attempt_no}: retryable ({resp})")
-            if attempt_no >= ARGS.max_attempts or time.time() >= deadline:
-                log(f"[{cport}] giving up after {attempt_no} attempts")
-                if last and last[1]:
-                    self._send_simple(200, {"Content-Type": "text/event-stream"}, last[1])
-                else:
-                    self._send_simple(503, {"Content-Type": "text/plain"}, b"relay: upstream overloaded\n")
+            if not self._wait_retry(delay):
+                log(f"[{port}] client cancelled during backoff")
                 return
-            delay = min(ARGS.backoff_max, ARGS.backoff_base * (1.6 ** (attempt_no - 1)))
-            delay *= random.uniform(0.7, 1.3)
-            time.sleep(delay)
+
+    def _wait_retry(self, delay):
+        until = time.monotonic() + delay
+        while time.monotonic() < until:
+            if self._client_gone():
+                return False
+            time.sleep(min(0.05, max(0, until - time.monotonic())))
+        return not self._client_gone()
 
     def _client_gone(self):
-        """True when the Codex side has closed its end of the socket."""
         try:
             readable, _, _ = select.select([self.connection], [], [], 0)
-            if not readable:
-                return False
-            return self.connection.recv(1, socket.MSG_PEEK) == b""
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
         except (OSError, ValueError):
             return True
 
     def _passthrough(self, path, headers, body):
-        started = time.time()
         conn = upstream_connection(ARGS.timeout)
         try:
             conn.request(self.command, path, body=body or None, headers=headers)
-            resp = conn.getresponse()
-            data = resp.read()
-            self._send_simple(resp.status, dict(resp.getheaders()), data)
-            log(f"[{self.client_address[1]}] {self.command} {path} -> {resp.status} "
-                f"{len(data)}B in {time.time() - started:.1f}s")
-        except Exception as exc:  # noqa: BLE001
-            log(f"[{self.client_address[1]}] {self.command} {path} -> error {exc!r}")
-            self._send_simple(502, {"Content-Type": "text/plain"}, f"relay: {exc}\n".encode())
+            response = conn.getresponse()
+            self._send_simple(response.status, dict(response.getheaders()), response.read())
+        except (OSError, http.client.HTTPException):
+            self._send_simple(502, {"Content-Type": "text/plain"}, b"relay: upstream unavailable\n")
         finally:
             conn.close()
 
-    def _stream_back(self, resp_headers, prelude, conn, resp):
-        self.send_response(200)
-        ctype = resp_headers.get("Content-Type") or "text/event-stream"
-        self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
-        sent_text = b"response.output_text.delta" in prelude
-        buf = b""
+    def _stream_back(self, result, response, port):
+        tail = SSETail()
+        tail.feed(result.body)
         try:
-            self.wfile.write(prelude)
+            self._send_headers(result.status, result.headers)
+            self.wfile.write(result.body)
             self.wfile.flush()
             while True:
-                chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
+                chunk = response.read1(65536)
                 if not chunk:
                     break
-                buf += chunk
-                drop = False
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if not line.startswith(b"data:"):
-                        continue
-                    payload = line[5:].strip()
-                    low = payload.lower()
-                    if not (
-                        b"overload" in low
-                        or b"at capacity" in low
-                        or b'"response.failed"' in payload
-                    ):
-                        continue
-                    try:
-                        evt = json.loads(payload)
-                    except (ValueError, TypeError):
-                        continue
-                    err = (evt.get("response") or {}).get("error") or evt.get("error") or {}
-                    if is_overload(err) and not sent_text:
-                        log("mid-stream overload after commit -> dropping connection for client retry")
-                        drop = True
-                        break
-                if drop:
-                    conn.close()
-                    return
+                tail.feed(chunk)
                 self.wfile.write(chunk)
                 self.wfile.flush()
-                if b"response.output_text.delta" in chunk:
-                    sent_text = True
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        finally:
-            conn.close()
+        except (OSError, http.client.HTTPException):
+            # Never force a retry after releasing text, reasoning or tool events.
+            log(f"[{port}] committed stream closed")
+        log(f"[{port}] stream ended: {tail.events} events, last [{tail.last}]"
+            + (f", failure [{tail.failure}]" if tail.failure else ""))
 
-    def _send_simple(self, status, headers, data):
+    def _send_headers(self, status, headers, length=None):
         self.send_response(status)
-        for k, v in headers.items():
-            if k.lower() in HOP_BY_HOP:
-                continue
-            self.send_header(k, v)
-        self.send_header("Content-Length", str(len(data)))
+        for key, value in clean_headers(headers).items():
+            self.send_header(key, value)
+        if length is not None:
+            self.send_header("Content-Length", str(length))
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+
+    def _send_simple(self, status, headers, data):
         try:
+            self._send_headers(status, headers, len(data))
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -437,33 +238,35 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def parse_upstream(value):
-    scheme = "https"
-    if value.startswith("http://"):
-        scheme, value = "http", value[len("http://"):]
-    elif value.startswith("https://"):
-        value = value[len("https://"):]
-    hostport, _, path = value.partition("/")
-    host, _, port = hostport.partition(":")
-    port = int(port) if port else (80 if scheme == "http" else 443)
-    prefix = "/" + path.strip("/") if path.strip("/") else ""
-    return scheme, host, port, prefix
+    parsed = urlsplit(value if "://" in value else "https://" + value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("upstream must be an HTTP(S) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("upstream must not contain credentials, query or fragment")
+    if parsed.scheme == "http" and parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError("non-local upstream requires HTTPS")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return parsed.scheme, parsed.hostname, port, parsed.path.rstrip("/")
 
 
 def main():
     global ARGS
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8787)
-    p.add_argument("--upstream", default="chatgpt.com/backend-api/codex")
+    p.add_argument("--upstream", default="https://cchost.ai/v1")
     p.add_argument("--proxy", default="", help="e.g. http://127.0.0.1:7897")
-    p.add_argument("--max-attempts", type=int, default=30)
+    p.add_argument("--max-attempts", type=int, default=10)
     p.add_argument("--total-budget", type=float, default=300.0)
     p.add_argument("--backoff-base", type=float, default=1.0)
     p.add_argument("--backoff-max", type=float, default=8.0)
-    p.add_argument("--commit-deadline", type=float, default=120.0,
+    p.add_argument("--commit-deadline", type=float, default=300.0,
                    help="max seconds to hold the stream head while deciding to retry")
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--log", default="")
     ARGS = p.parse_args()
+    positive = (ARGS.max_attempts, ARGS.total_budget, ARGS.commit_deadline, ARGS.timeout)
+    if not 0 < ARGS.port < 65536 or min(positive) <= 0 or min(ARGS.backoff_base, ARGS.backoff_max) < 0:
+        p.error("invalid port, retry count or timeout")
 
     if ARGS.log and os.path.exists(ARGS.log):
         try:
@@ -474,10 +277,12 @@ def main():
         parse_upstream(ARGS.upstream)
     )
     if ARGS.proxy:
-        host, _, port = ARGS.proxy.replace("http://", "").partition(":")
-        ARGS.proxy = (host, int(port or 80))
+        proxy = urlsplit(ARGS.proxy)
+        if proxy.scheme != "http" or not proxy.hostname or proxy.username or proxy.password:
+            p.error("proxy must be an HTTP URL without credentials")
+        ARGS.proxy = (proxy.hostname, proxy.port or 80)
 
-    log(f"relay listening on 127.0.0.1:{ARGS.port} -> https://{ARGS.upstream} via {ARGS.proxy}")
+    log(f"relay listening on 127.0.0.1:{ARGS.port} upstream={ARGS.upstream_host}")
     srv = ThreadingHTTPServer(("127.0.0.1", ARGS.port), Handler)
     srv.daemon_threads = True
     try:
