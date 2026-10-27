@@ -25,17 +25,17 @@ class FramingTests(unittest.TestCase):
 
     def test_unknown_event_and_bad_json_commit(self):
         for payload in (b"[]", b"null", b"[DONE]", b"invalid", b'{"type":"new-tool-event"}'):
-            self.assertEqual(classify_event(payload), "commit")
+            self.assertEqual(classify_event(payload)[0], "commit")
 
     def test_only_known_empty_assistant_message_can_remain_uncommitted(self):
         item = {"type": "message", "role": "assistant", "content": [], "status": "in_progress"}
-        self.assertIsNone(classify_event(json.dumps({"type": "response.output_item.added", "item": item})))
+        self.assertIsNone(classify_event(json.dumps({"type": "response.output_item.added", "item": item}))[0])
         for changed in ({"content": [{"type": "output_text", "text": "output"}]},
                         {"type": "function_call", "arguments": "{}"},
                         {"type": "reasoning"}, {"unknown_field": "output"}):
             with self.subTest(changed=changed):
                 payload = {"type": "response.output_item.added", "item": {**item, **changed}}
-                self.assertEqual(classify_event(json.dumps(payload)), "commit")
+                self.assertEqual(classify_event(json.dumps(payload))[0], "commit")
 
     def test_tail_diagnostics_never_raise_or_grow_unbounded(self):
         for body in (b"x" * (SSETail.BUFFER_LIMIT + 1), b"data: invalid\n\n"):

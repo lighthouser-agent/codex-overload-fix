@@ -1,5 +1,6 @@
 """Inspect only the uncommitted SSE head; never replay observable output."""
 
+import contextlib
 import email.utils
 import http.client
 import json
@@ -88,14 +89,14 @@ def commit_reason(event):
             "response.function_call_arguments.delta": "tool_output"}.get(kind, "unknown_event")
 
 
-def classify_event(payload, metadata=None):
-    """Unknown events commit conservatively, including every tool/reasoning event."""
+def classify_event(payload):
+    """Return (verdict, reason); unknown events commit conservatively, as do tool/reasoning events."""
     try:
         event = json.loads(payload)
     except (ValueError, TypeError):
-        return "commit"
+        return "commit", "unknown_event"
     if not isinstance(event, dict):
-        return "commit"
+        return "commit", "unknown_event"
     kind = event.get("type")
     response = event.get("response")
     error = response.get("error") if isinstance(response, dict) else None
@@ -105,25 +106,18 @@ def classify_event(payload, metadata=None):
     if kind is None and isinstance(error, dict) and set(event) <= {"error", "sequence_number"}:
         kind = "error"
     if kind in ("error", "response.error", "response.failed"):
-        if metadata is not None:
-            metadata["error_event"] = True
-        return "retry" if is_overload(error) else "commit"
+        return ("retry" if is_overload(error) else "commit"), "error_event_passthrough"
     if kind in SETUP_EVENTS or empty_message_item(event):
-        return None
-    if metadata is not None:
-        metadata["commit_reason"] = commit_reason(event)
-    return "commit"
+        return None, None
+    return "commit", commit_reason(event)
 
 
-class SSEHead:
+class SSEFrames:
     """Frame SSE across arbitrary TCP chunks, including multiline data fields."""
 
     def __init__(self):
         self.buffer = b""
         self.data = []
-        self.error_event = False
-        self.commit_reason = "unknown_event"
-        self.detail = ""
 
     def payloads(self, chunk):
         self.buffer += chunk
@@ -137,19 +131,26 @@ class SSEHead:
                 self.data = []
                 yield payload
 
+
+
+class SSEHead(SSEFrames):
+    """Classify the uncommitted head; stop at the first retry or commit verdict."""
+
+    def __init__(self):
+        super().__init__()
+        self.reason = "unknown_event"
+        self.detail = ""
+
     def feed(self, chunk):
         for payload in self.payloads(chunk):
-            metadata = {}
-            verdict = classify_event(payload, metadata)
-            self.error_event = metadata.get("error_event", False)
-            self.commit_reason = metadata.get("commit_reason", "unknown_event")
+            verdict, reason = classify_event(payload)
             if verdict:
-                self.detail = describe(payload)
+                self.reason, self.detail = reason, describe(payload)
                 return verdict
         return None
 
 
-class SSETail(SSEHead):
+class SSETail(SSEFrames):
     """Follow forwarded bytes to log how a committed stream ended; never alters them."""
 
     FAILURE_MARKERS = ("error", "fail", "incomplete")
@@ -163,13 +164,16 @@ class SSETail(SSEHead):
         self.failure = ""
         self.stopped = False
 
+    def _stop(self):
+        self.stopped, self.buffer, self.data = True, b"", []
+        self.last = "untracked"
+
     def feed(self, chunk):
         if self.stopped:
-            return None
+            return
         if len(self.buffer) + sum(map(len, self.data)) + len(chunk) > self.BUFFER_LIMIT:
-            self.stopped, self.buffer, self.data = True, b"", []
-            self.last = "untracked"
-            return None
+            self._stop()
+            return
         try:
             for payload in self.payloads(chunk):
                 self.events += 1
@@ -177,9 +181,7 @@ class SSETail(SSEHead):
                 if not self.failure and any(marker in self.last for marker in self.FAILURE_MARKERS):
                     self.failure = f"#{self.events} {self.last}"
         except Exception:  # diagnostics must never break a committed stream
-            self.stopped, self.buffer, self.data = True, b"", []
-            self.last = "untracked"
-        return None
+            self._stop()
 
 
 def retry_after(headers):
@@ -243,16 +245,14 @@ class StreamAttempt:
                 self.abort_reason = "client_closed"
             elif not self.committed and time.monotonic() >= self.deadline:
                 self.abort_reason = "deadline"
-            if self.abort_reason:
-                sock = self.sock or self.conn.sock
-                if sock:
-                    try:
-                        sock.shutdown(socket.SHUT_RDWR)
-                    except OSError:
-                        pass
-                # A connection still being established is checked again next tick.
-                if sock:
-                    return
+            if not self.abort_reason:
+                continue
+            sock = self.sock or self.conn.sock
+            # A connection still being established is checked again next tick.
+            if sock:
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
+                return
 
     def run(self, path, headers, body):
         try:
@@ -324,5 +324,4 @@ class StreamAttempt:
                 return Result("retry", 200, headers, bytes(prelude), "sse_overload", detail=parser.detail)
             if verdict == "commit" or len(prelude) >= 262144:
                 self._commit()
-                reason = "error_event_passthrough" if parser.error_event else parser.commit_reason
-                return Result("stream", 200, headers, bytes(prelude), reason, detail=parser.detail)
+                return Result("stream", 200, headers, bytes(prelude), parser.reason, detail=parser.detail)

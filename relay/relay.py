@@ -204,9 +204,9 @@ class Handler(BaseHTTPRequestHandler):
                 chunk = response.read1(65536)
                 if not chunk:
                     break
-                tail.feed(chunk)
                 self.wfile.write(chunk)
                 self.wfile.flush()
+                tail.feed(chunk)
         except (OSError, http.client.HTTPException):
             # Never force a retry after releasing text, reasoning or tool events.
             log(f"[{port}] committed stream closed")

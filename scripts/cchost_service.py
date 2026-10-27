@@ -7,7 +7,6 @@ import plistlib
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -50,7 +49,7 @@ def health(port, upstream):
         actual = actual if "://" in actual else "https://" + actual
         return (data.get("service") == "cchost-codex-retry"
                 and validate_upstream(actual) == validate_upstream(upstream))
-    except (OSError, ValueError, AttributeError, TypeError, urllib.error.URLError):
+    except (OSError, ValueError, AttributeError, TypeError):  # URLError is an OSError
         return False
 
 
