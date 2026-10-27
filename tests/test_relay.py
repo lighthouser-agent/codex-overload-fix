@@ -1,5 +1,8 @@
+import argparse
 import gzip
 import http.client
+import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -11,7 +14,9 @@ from unittest.mock import Mock, patch
 from tests.harness import OVERLOAD, ROOT, SUCCESS, Relay, event, sse
 
 sys.path.insert(0, str(ROOT / "relay"))
-from sse import SSEHead, SSETail, StreamAttempt, classify_event, describe, is_denied
+sys.path.insert(0, str(ROOT / "tools"))
+import analyze_log
+from sse import LateOverload, SSEHead, SSETail, StreamAttempt, classify_event, describe, is_denied
 
 
 class FramingTests(unittest.TestCase):
@@ -39,6 +44,17 @@ class FramingTests(unittest.TestCase):
             with self.subTest(changed=changed):
                 payload = {"type": "response.output_item.added", "item": {**item, **changed}}
                 self.assertEqual(classify_event(json.dumps(payload))[0], "commit")
+
+    def test_log_falls_back_to_stderr_when_log_file_fails(self):
+        spec = importlib.util.spec_from_file_location("relay_main", ROOT / "relay/relay.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            module.ARGS = argparse.Namespace(log=directory)
+            with patch("sys.stdout", io.StringIO()) as out, patch("sys.stderr", io.StringIO()) as err:
+                module.log("unwritable log file")
+        self.assertIn("unwritable log file", out.getvalue())
+        self.assertIn("unwritable log file", err.getvalue())
 
     def test_tail_diagnostics_never_raise_or_grow_unbounded(self):
         for body in (b"x" * (SSETail.BUFFER_LIMIT + 1), b"data: invalid\n\n"):
@@ -93,7 +109,8 @@ class RelayTests(unittest.TestCase):
                      "response.function_call_arguments.delta"):
             body = event(kind, delta="private-output") + OVERLOAD
             chunks = [bytes([byte]) for byte in body]
-            with self.subTest(kind=kind), Relay([(200, headers, chunks)]) as relay:
+            # CCHost mode: the late overload is forwarded, never replayed by the relay.
+            with self.subTest(kind=kind), Relay([(200, headers, chunks)], "--forward-late-overload") as relay:
                 self.assertEqual(relay.request()[2], body)
                 self.assertEqual(len(relay.server.requests), 1)
 
@@ -289,15 +306,64 @@ class CCHostCaptureTests(unittest.TestCase):
             connection.request("GET", "/__codex_retry/health")
             health = json.loads(connection.getresponse().read())
             connection.close()
-        self.assertEqual(health["upstream"], "https://chatgpt.com/backend-api/codex")
+            self.assertIn("-> https://chatgpt.com/backend-api/codex", relay.output.read_text())
+        self.assertEqual(health["upstream"], "chatgpt.com/backend-api/codex")
 
-    def test_log_file_is_not_duplicated_on_stdout(self):
+    def test_upstream_log_tool_still_reads_relay_log(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "relay.log"
-            with Relay([sse(SUCCESS)], "--log", str(path)) as relay:
+            with Relay([sse(OVERLOAD), sse(SUCCESS)], "--log", str(path)) as relay:
                 self.assertEqual(relay.request()[2], SUCCESS)
-                self.assertIn("POST /responses", path.read_text())
-                self.assertNotIn("POST /responses", relay.output.read_text())
+            (record,) = analyze_log.parse(str(path)).values()
+        self.assertEqual((record["attempts"], record["ok"], record["kinds"]), (2, 1, ["overload"]))
+        self.assertEqual(record["model"], "test-model")
+
+    def test_late_overload_before_text_drops_stream_unless_forwarding(self):
+        reasoning = event("response.output_item.added", item={"type": "reasoning", "id": "rs_1"})
+        late = event("error", error={"code": "server_is_overloaded", "message": "private-error-text"})
+        reply = [sse(reasoning, 0.2, late)]
+        with Relay(reply) as relay:
+            self.assertEqual(relay.request()[2], reasoning)
+            self.assertIn("dropping connection for client retry", relay.output.read_text())
+        with Relay(reply, "--forward-late-overload") as relay:
+            self.assertEqual(relay.request()[2], reasoning + late)
+        text = event("response.output_text.delta", delta="private-output")
+        with Relay([sse(text, 0.2, late)]) as relay:
+            self.assertEqual(relay.request()[2], text + late)
+        self.assertTrue(LateOverload(b"").armed)
+        with patch("sse.is_overload", side_effect=RecursionError):
+            self.assertFalse(LateOverload(b"").check(late))
+
+    def test_late_overload_detector_frames_across_chunks(self):
+        text = event("response.output_text.delta", delta="hi")
+        bare = event("error", code="server_is_overloaded")
+        split = LateOverload(b"")
+        split.check(text[:30])
+        split.check(text[30:])
+        self.assertFalse(split.armed)
+        self.assertFalse(split.check(bare))
+        self.assertTrue(LateOverload(b"").check(bare))
+        self.assertTrue(LateOverload(bare[:20]).check(bare[20:]))
+        quota = event("error", error={"code": "insufficient_quota", "message": "overloaded"})
+        self.assertFalse(LateOverload(b"").check(quota))
+
+    def test_request_summary_never_blocks_or_forges_log_lines(self):
+        forged = json.dumps({"model": "x\n2026-10-27 00:00:00 [1] POST /responses (999999B)"}).encode()
+        with Relay([sse(SUCCESS)]) as relay:
+            self.assertEqual(relay.request(b"[1]")[2], SUCCESS)
+            self.assertEqual(relay.request(forged)[2], SUCCESS)
+            logs = relay.output.read_text()
+        self.assertIn("analyze-failed(AttributeError)", logs)
+        self.assertNotIn("\n2026-10-27 00:00:00 [1]", logs)
+
+    def test_event_head_log_names_served_model_without_content(self):
+        created = event("response.created", response={"model": "served-model", "status": "in_progress"})
+        with Relay([sse(created, SUCCESS)]) as relay:
+            self.assertEqual(relay.request()[2], created + SUCCESS)
+            logs = relay.output.read_text()
+        self.assertIn("evt#1 response.created [served=served-model]", logs)
+        self.assertIn("evt#2 response.output_text.delta", logs)
+        self.assertNotIn("private-output", logs)
 
     def test_committed_stream_end_is_logged_without_content(self):
         error = {"code": "server_is_overloaded", "message": "private-error-text"}

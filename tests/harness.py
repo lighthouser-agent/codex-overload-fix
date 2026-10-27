@@ -56,6 +56,9 @@ class FakeUpstream(BaseHTTPRequestHandler):
         server.started.set()
         try:
             for chunk in chunks:
+                if isinstance(chunk, float):
+                    time.sleep(chunk)
+                    continue
                 if chunk is None:
                     self.connection.settimeout(4)
                     if self.connection.recv(1) == b"":

@@ -147,9 +147,25 @@ class SSEHead(SSEFrames):
         super().__init__()
         self.reason = "unknown_event"
         self.detail = ""
+        self.events = []
+
+    def _note(self, payload):
+        """Upstream's evt#N head log, minus the payload bytes it used to include."""
+        if not payload or payload == b"[DONE]" or len(self.events) >= 12:
+            return
+        try:
+            event = json.loads(payload)
+        except (ValueError, TypeError):
+            event = None
+        event = event if isinstance(event, dict) else {}
+        response = event.get("response")
+        served = response.get("model") if isinstance(response, dict) else None
+        line = f"evt#{len(self.events) + 1} {token(event.get('type'))}"
+        self.events.append(line + (f" [served={token(served)}]" if served else ""))
 
     def feed(self, chunk):
         for payload in self.payloads(chunk):
+            self._note(payload)
             verdict, reason = classify_event(payload)
             if verdict:
                 self.reason, self.detail = reason, describe(payload)
@@ -191,6 +207,39 @@ class SSETail(SSEFrames):
             self._stop()
 
 
+class LateOverload(SSEFrames):
+    """Upstream behavior: an overload after commit but before any text drops the stream,
+    so a client with stream retries enabled asks again instead of showing the error."""
+
+    # Like upstream, only parse payloads that could carry an error.
+    MARKERS = (b"error", b"overload", b"capacity", b"failed")
+
+    def __init__(self, prelude):
+        super().__init__()
+        self.armed = True
+        # Frame the prelude too, so an event split across it and the next chunk still parses.
+        self.check(prelude)
+
+    def check(self, chunk):
+        """Return True when this chunk must not be forwarded; never raises."""
+        if not self.armed:
+            return False
+        if len(self.buffer) + sum(map(len, self.data)) + len(chunk) > SSETail.BUFFER_LIMIT:
+            self.armed = False
+            return False
+        hit = False
+        try:
+            for payload in self.payloads(chunk):
+                if b'"response.output_text.delta"' in payload:
+                    # Once text reached the client, a retry would repeat output it already showed.
+                    self.armed = False
+                elif self.armed and any(marker in payload.lower() for marker in self.MARKERS):
+                    hit = hit or classify_event(payload)[0] == "retry"
+        except Exception:  # detection must never break a committed stream
+            self.armed = False
+        return hit
+
+
 def retry_after(headers):
     value = headers.get("Retry-After", "")
     try:
@@ -218,6 +267,7 @@ class Result:
     reason: str = ""
     delay: float = 0.0
     detail: str = ""
+    events: list = field(default_factory=list)
 
 
 class StreamAttempt:
@@ -272,7 +322,7 @@ class StreamAttempt:
                 if self.abort_reason or time.monotonic() >= self.deadline:
                     raise
                 return Result("retry", 502, {"Content-Type": "text/plain"},
-                              b"relay: upstream connection unavailable\n", "connect_" + type(exc).__name__)
+                              b"relay: upstream connection unavailable\n", "connect/read error: " + type(exc).__name__)
             self.sock = self.conn.sock
             if self.abort_reason:
                 raise OSError(self.abort_reason)
@@ -315,7 +365,7 @@ class StreamAttempt:
         transient = status in (500, 502, 503, 504) and not is_denied(error)
         limited = status == 429 and is_overload(error)
         mode = "retry" if transient or limited else "passthrough"
-        return Result(mode, status, headers, body, f"http_{status}", retry_after(self.response.headers))
+        return Result(mode, status, headers, body, f"http {status}", retry_after(self.response.headers))
 
     def _read_head(self, headers, sniff=False):
         prelude = bytearray()
@@ -333,7 +383,9 @@ class StreamAttempt:
                 return Result("stream", 200, headers, bytes(prelude), "non_sse_body")
             verdict = parser.feed(chunk)
             if verdict == "retry":
-                return Result("retry", 200, headers, bytes(prelude), "sse_overload", detail=parser.detail)
+                return Result("retry", 200, headers, bytes(prelude), "sse_overload",
+                              detail=parser.detail, events=parser.events)
             if verdict == "commit" or len(prelude) >= 262144:
                 self._commit()
-                return Result("stream", 200, headers, bytes(prelude), parser.reason, detail=parser.detail)
+                return Result("stream", 200, headers, bytes(prelude), parser.reason,
+                              detail=parser.detail, events=parser.events)

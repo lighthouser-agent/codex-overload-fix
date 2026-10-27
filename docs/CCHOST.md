@@ -9,11 +9,14 @@
 macOS和Linux安装命令相同：
 
 ```bash
+git clone https://github.com/lighthouser-agent/codex-overload-fix.git
+cd codex-overload-fix
 python3 scripts/cchost.py install --dry-run
 python3 scripts/cchost.py install
 python3 scripts/cchost.py status
 ```
 
+配置优先按`CODEX_HOME`定位，否则从`.codex-cli`和`.codex`识别唯一启用CCHost的配置。
 安装器发现多份CCHost配置时，要求用`--config`指定目标。
 它验证中继健康后才修改配置，并保留原文件备份。
 重复安装不会覆盖第一次保存的恢复信息。
@@ -23,6 +26,16 @@ python3 scripts/cchost.py install --config /absolute/path/config.toml --port 878
 ```
 
 CCHost表里的`auth`、`env_key`和其他认证设置保持原值。
+安装器也保留`model_provider = "cchost"`、模型、MCP和其他设置。
+它只管理已有CCHost表中的四个字段：
+
+| 字段 | 安装后的值 |
+|---|---|
+| `base_url` | `http://127.0.0.1:8787` |
+| `supports_websockets` | `false` |
+| `stream_max_retries`和`request_max_retries` | `0` |
+
+中继使用HTTP/SSE，客户端重试交给中继统一处理。
 安装后仍使用`cchost`这个provider，原有会话沿用该provider。
 已经启动的客户端需要重启，才能读取新设置。
 
@@ -44,10 +57,11 @@ Windows自启动尚未适配和实机验证。
 可以在一个终端手动运行中继，保持该终端开启：
 
 ```powershell
-python relay/relay.py --upstream https://cchost.ai/v1 --port 8787 --max-attempts 10
+python relay/relay.py --upstream https://cchost.ai/v1 --port 8787 --max-attempts 10 --commit-deadline 300 --forward-late-overload
 ```
 
 手动运行必须传`--upstream`。不传时中继沿用上游项目的ChatGPT默认地址。
+其余参数不传时也沿用上游默认值：最多尝试30次，未提交的流等待120秒。
 
 另一个终端接入配置：
 
@@ -62,7 +76,7 @@ python scripts/cchost.py status --config C:/path/to/config.toml
 
 ## 查看运行状态
 
-默认最多尝试10次，包含首次请求。
+自动服务最多尝试10次，包含首次请求。
 每次请求的重试总预算为300秒。
 出现可观察输出后直接转发，不再重放该请求。
 
@@ -79,11 +93,17 @@ python3 scripts/cchost.py status
 | Linux | systemd用户服务为`cchost-codex-retry.service`，日志在`$XDG_STATE_HOME/cchost-codex-retry/`，未设置时使用`~/.local/state/` |
 
 中继日志写入`relay.log`，按8MB轮换。
-macOS的`service.log`只接收无法写入`relay.log`的行和Python异常输出。
-Linux的同类输出进入systemd日志。
+日志沿用上游格式，`tools/analyze_log.py`可以直接汇总。
+请求行记录字节数、模型、推理强度和各部分大小，不记录内容。
+每次尝试的前12个事件记录类型和实际服务的模型`served=`，不记录内容。
+放行和结束时记录事件类型、字段名和错误码。
+请求体和认证头原样转发，响应正文和错误消息不写入日志。
+自动服务丢弃中继的标准输出，避免和`relay.log`重复。
+`relay.log`写不进去时，日志行改写到错误输出。
+macOS的错误输出在`service.log`，Linux的错误输出进入systemd日志。
 
 日志中的`retryable`表示中继正在重试，`giving up`表示重试预算耗尽。
-`stream committed`后的方括号是放行时的事件形态，`stream ended`记录放行后的结束事件。
+`ok, streaming`后的方括号是放行时的事件形态，`stream ended`记录放行后的结束事件。
 放行后出现`failure`，说明错误发生在可见输出之后，中继不会重放。
 预算耗尽后，客户端会收到原来的错误。
 Orca的自动继续由现有容量巡检提供，本仓库不安装该巡检。
@@ -105,7 +125,26 @@ python3 scripts/cchost.py uninstall
 有显式配置时，卸载也传同一份`--config`。
 安装器恢复原来的上游、WebSocket设置和客户端重试设置。
 它只撤回自己管理的字段，保留后来修改的模型和其他配置。
+如果有人手动改了受管字段，卸载会保留现场并报错。
 备份和日志留在原处，便于检查。
+
+## 重试边界
+
+只在输出尚未开始且明确收到过载错误时重试SSE请求。
+HTTP500、502、503、504可重试；HTTP429只在明确标记过载时重试。
+额度、计费和认证错误直接返回。
+重试耗尽时保留上游状态、响应头和错误体，遵守`Retry-After`。
+取消请求会中断已建立的上游连接，并停止后续重试。
+
+上游中继在流开始后、正文出现前遇到过载时会断开连接，让客户端自己重试。
+自动服务传`--forward-late-overload`，改为原样转发这个错误。
+CCHost配置关闭了客户端重试，断开只会显示`stream disconnected`。
+Orca容量巡检认不出这种失败，原样转发才能触发自动继续。
+手动运行中继时也应传这个参数。
+
+中继不能增加CCHost或模型服务端容量。
+上游仍持续拒绝时，请求会等待重试后失败。
+Codex客户端和上游服务自行执行的重试不由中继保证。
 
 ## 已验证范围
 
@@ -121,8 +160,15 @@ CCHost过载时先发`response.metadata`再发错误，所以它也算初始化�
 推理、工具、有内容或未知事件都会停止重放。
 TCP或TLS建立连接失败时可以重试，已经发送请求后的模糊网络失败直接返回。
 尚未提交的SSE最多等待300秒；非流式成功响应使用独立的600秒读取超时。
-CI配置了macOS、Linux和Windows上的Python测试。
-CI尚未运行的状态不能算跨平台实机通过。
+CI在macOS、Linux和Windows上运行测试。
+它也在macOS和Linux上模拟安装服务。
+CI通过不等于实机安装验证，Linux和Windows尚未实机安装。
+
+```bash
+python3 -m unittest discover -s tests -t . -v
+```
+
+测试使用本地模拟上游，不访问真实模型服务。
 
 服务上线后仍须观察真实CCHost过载请求。
 成功完成一次普通请求可以验证认证和转发，不能证明容量错误已经消失。

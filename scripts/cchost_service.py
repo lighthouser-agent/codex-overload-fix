@@ -56,7 +56,9 @@ def health(port, upstream):
 def command(port, upstream, state, proxy):
     argv = [sys.executable, str(ROOT / "relay/relay.py"), "--port", str(port),
             "--upstream", upstream, "--log", str(state / "relay.log"),
-            "--max-attempts", "10", "--total-budget", "300", "--commit-deadline", "300"]
+            "--max-attempts", "10", "--total-budget", "300", "--commit-deadline", "300",
+            # Codex retries are off under CCHost, so a dropped stream would only fail as "stream disconnected".
+            "--forward-late-overload"]
     if proxy:
         argv.extend(["--proxy", proxy])
     return argv
@@ -68,12 +70,13 @@ def service_definition(port, upstream, proxy):
     if platform.system() == "Darwin":
         data = {"Label": LABEL, "ProgramArguments": argv, "RunAtLoad": True,
                 "KeepAlive": True, "ThrottleInterval": 10, "ProcessType": "Background",
-                "WorkingDirectory": str(state), "StandardOutPath": str(state / "service.log"),
+                # The relay also prints every --log line to stdout; keep only errors here.
+                "WorkingDirectory": str(state), "StandardOutPath": os.devnull,
                 "StandardErrorPath": str(state / "service.log")}
         return file, state, plistlib.dumps(data)
     quoted = " ".join('"' + arg.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"' for arg in argv)
     unit = ("[Unit]\nDescription=CCHost Codex retry relay\n\n[Service]\nType=simple\n"
-            f"ExecStart={quoted}\nRestart=always\nRestartSec=10\n\n"
+            f"ExecStart={quoted}\nStandardOutput=null\nRestart=always\nRestartSec=10\n\n"
             "[Install]\nWantedBy=default.target\n")
     return file, state, unit.encode()
 

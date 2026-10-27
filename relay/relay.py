@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Local retry relay for Codex /responses.
 
-Listens on http://127.0.0.1:<port> and forwards to --upstream, retrying when
-the upstream answers with a server-overload ("Selected model is at capacity")
-response instead of handing that failure straight to Codex. The default
-upstream stays ChatGPT for the legacy installers; scripts/cchost.py passes the
-CCHost URL explicitly.
+Listens on http://127.0.0.1:<port> and forwards to
+https://chatgpt.com/backend-api/codex, retrying when the upstream answers
+with a server-overload ("Selected model is at capacity") response instead of
+handing that failure straight to Codex. scripts/cchost.py passes --upstream
+for CCHost.
 
 Everything is byte-transparent: request bodies (including zstd-compressed
 ones) and auth headers are forwarded untouched. Only the very start of the
@@ -13,6 +13,8 @@ SSE stream is inspected to decide whether the attempt succeeded.
 """
 
 import argparse
+import contextlib
+import gzip
 import http.client
 import json
 import os
@@ -23,10 +25,11 @@ import socketserver
 import sys
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from sse import SSETail, StreamAttempt
+from sse import LateOverload, SSETail, StreamAttempt
 
 HOP_BY_HOP = {
     "connection",
@@ -49,6 +52,8 @@ LOG_MAX = 8 * 1024 * 1024
 def log(msg):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
     with LOG_LOCK:
+        with contextlib.suppress(OSError, ValueError):
+            print(line, flush=True)
         if ARGS.log:
             try:
                 if LOG_SIZE[0] > LOG_MAX:
@@ -57,11 +62,10 @@ def log(msg):
                 with open(ARGS.log, "a", encoding="utf-8") as f:
                     f.write(line + "\n")
                 LOG_SIZE[0] += len(line) + 1
-                return
             except OSError:
-                pass
-        # Services capture stdout without rotation, so it only carries lines the log file could not.
-        print(line, flush=True)
+                # The CCHost service discards stdout, so stderr is the only record left.
+                with contextlib.suppress(OSError, ValueError):
+                    print(line, file=sys.stderr, flush=True)
 
 
 ARGS = None
@@ -113,6 +117,70 @@ def forward_headers(handler):
     return out
 
 
+def analyze(handler, body):
+    """One-line size breakdown of a /responses body. Sizes only, no content."""
+    if len(body) > 64 << 20:
+        return f" | analyze-skipped({len(body)}B too large)"
+    enc = (handler.headers.get("Content-Encoding") or "").lower()
+    try:
+        if enc in ("", "identity"):
+            raw = body
+        elif enc == "gzip":
+            raw = gzip.decompress(body)
+        elif enc == "deflate":
+            raw = zlib.decompress(body)
+        elif enc == "zstd":
+            try:
+                from compression import zstd
+                raw = zstd.decompress(body)
+            except Exception:
+                import zstandard
+                raw = zstandard.ZstdDecompressor().decompress(body, max_output_size=64 << 20)
+        else:
+            return f" enc={enc} analysis-skipped"
+        doc = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        return f" analyze-failed({exc.__class__.__name__})"
+
+    parts = []
+    if doc.get("model"):
+        parts.append(f"model={doc['model']}")
+    _r = doc.get("reasoning") or {}
+    if isinstance(_r, dict) and _r.get("effort"):
+        parts.append(f"effort={_r['effort']}")
+    if doc.get("service_tier"):
+        parts.append(f"tier={doc['service_tier']}")
+    if isinstance(doc.get("instructions"), str):
+        parts.append(f"instructions={len(doc['instructions'])}c")
+    tools = doc.get("tools") or []
+    if tools:
+        tb = len(json.dumps(tools, ensure_ascii=False).encode())
+        parts.append(f"tools={tb}B/{len(tools)}")
+    items = doc.get("input") or []
+    if isinstance(items, list):
+        by = {}
+        for it in items:
+            role = it.get("type") or "?"
+            if role == "message":
+                role = "msg:" + (it.get("role") or "?")
+            b = len(json.dumps(it, ensure_ascii=False).encode())
+            by[role] = by.get(role, 0) + b
+        top = ",".join(f"{k}={v}" for k, v in sorted(by.items(), key=lambda kv: -kv[1])[:4])
+        parts.append(f"input={len(json.dumps(items, ensure_ascii=False).encode())}B/{len(items)}it({top})")
+    if doc.get("prompt_cache_key"):
+        parts.append("cache_key=yes")
+    return " | " + (" ".join(parts) if parts else "empty")
+
+
+def request_summary(handler, body):
+    """Upstream's analyze() line, guarded so it can neither block forwarding nor forge log lines."""
+    try:
+        summary = analyze(handler, body)
+    except Exception as exc:  # noqa: BLE001 - e.g. a JSON body that is not an object
+        return f" analyze-failed({exc.__class__.__name__})"
+    return "".join(char if char.isprintable() else "?" for char in summary)[:2000]
+
+
 class Handler(BaseHTTPRequestHandler):
     """Forward requests; retry only confirmed overload before observable output."""
 
@@ -133,14 +201,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         headers = forward_headers(self)
         path = ARGS.upstream_prefix + self.path
-        if self.command == "POST" and self.path.split("?")[0].rstrip("/") == "/responses":
+        if self.command == "POST" and self.path.split("?")[0].endswith("/responses"):
             self._retry_responses(path, headers, body)
         else:
             self._passthrough(path, headers, body)
 
     def _retry_responses(self, path, headers, body):
         port = self.client_address[1]
-        log(f"[{port}] POST /responses ({len(body)}B)")
+        log(f"[{port}] {self.command} {self.path} ({len(body)}B){request_summary(self, body)}")
         deadline = time.monotonic() + ARGS.total_budget
         for number in range(1, ARGS.max_attempts + 1):
             if self._client_gone():
@@ -148,12 +216,13 @@ class Handler(BaseHTTPRequestHandler):
             commit_by = min(deadline, time.monotonic() + ARGS.commit_deadline)
             with StreamAttempt(upstream_connection, ARGS.timeout, commit_by, self._client_gone) as attempt:
                 result = attempt.run(path, headers, body)
+                for line in result.events:
+                    log(f"[{port}]   {line}")
                 if attempt.abort_reason == "client_closed":
                     log(f"[{port}] client cancelled")
                     return
                 if result.mode == "stream":
-                    log(f"[{port}] attempt {number}: stream committed ({result.reason}); "
-                        f"forwarding [{result.detail}]")
+                    log(f"[{port}] attempt {number}: ok, streaming ({result.reason}) [{result.detail}]")
                     self._stream_back(result, attempt.response, port)
                     return
             if result.mode != "retry":
@@ -187,19 +256,25 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
     def _passthrough(self, path, headers, body):
+        started = time.time()
         conn = upstream_connection(ARGS.timeout)
         try:
             conn.request(self.command, path, body=body or None, headers=headers)
-            response = conn.getresponse()
-            self._send_simple(response.status, dict(response.getheaders()), response.read())
-        except (OSError, http.client.HTTPException):
-            self._send_simple(502, {"Content-Type": "text/plain"}, b"relay: upstream unavailable\n")
+            resp = conn.getresponse()
+            data = resp.read()
+            self._send_simple(resp.status, dict(resp.getheaders()), data)
+            log(f"[{self.client_address[1]}] {self.command} {path} -> {resp.status} "
+                f"{len(data)}B in {time.time() - started:.1f}s")
+        except Exception as exc:  # noqa: BLE001
+            log(f"[{self.client_address[1]}] {self.command} {path} -> error {exc!r}")
+            self._send_simple(502, {"Content-Type": "text/plain"}, f"relay: {exc}\n".encode())
         finally:
             conn.close()
 
     def _stream_back(self, result, response, port):
         tail = SSETail()
         tail.feed(result.body)
+        late = None if ARGS.forward_late_overload else LateOverload(result.body)
         try:
             self._send_headers(result.status, result.headers)
             self.wfile.write(result.body)
@@ -208,11 +283,14 @@ class Handler(BaseHTTPRequestHandler):
                 chunk = response.read1(65536)
                 if not chunk:
                     break
+                if late and late.check(chunk):
+                    log(f"[{port}] mid-stream overload after commit -> dropping connection for client retry")
+                    break
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 tail.feed(chunk)
         except (OSError, http.client.HTTPException):
-            # Never force a retry after releasing text, reasoning or tool events.
+            # The relay itself never replays a request after commit.
             log(f"[{port}] committed stream closed")
         log(f"[{port}] stream ended: {tail.events} events, last [{tail.last}]"
             + (f", failure [{tail.failure}]" if tail.failure else ""))
@@ -267,16 +345,19 @@ def main():
     global ARGS
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8787)
-    p.add_argument("--upstream", default="https://chatgpt.com/backend-api/codex")
+    p.add_argument("--upstream", default="chatgpt.com/backend-api/codex")
     p.add_argument("--proxy", default="", help="e.g. http://127.0.0.1:7897")
-    p.add_argument("--max-attempts", type=int, default=10)
+    p.add_argument("--max-attempts", type=int, default=30)
     p.add_argument("--total-budget", type=float, default=300.0)
     p.add_argument("--backoff-base", type=float, default=1.0)
     p.add_argument("--backoff-max", type=float, default=8.0)
-    p.add_argument("--commit-deadline", type=float, default=300.0,
+    p.add_argument("--commit-deadline", type=float, default=120.0,
                    help="max seconds to hold the stream head while deciding to retry")
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--log", default="")
+    p.add_argument("--forward-late-overload", action="store_true",
+                   help="forward an overload that arrives after streaming starts instead of dropping "
+                        "the connection; for clients whose stream retries are off")
     ARGS = p.parse_args()
     positive = (ARGS.max_attempts, ARGS.total_budget, ARGS.commit_deadline, ARGS.timeout)
     if not 0 < ARGS.port < 65536 or min(positive) <= 0 or min(ARGS.backoff_base, ARGS.backoff_max) < 0:
@@ -296,7 +377,8 @@ def main():
             p.error("proxy must be an HTTP URL without credentials")
         ARGS.proxy = (proxy.hostname, proxy.port or 80)
 
-    log(f"relay listening on 127.0.0.1:{ARGS.port} upstream={ARGS.upstream_host}")
+    target = ARGS.upstream if "://" in ARGS.upstream else "https://" + ARGS.upstream
+    log(f"relay listening on 127.0.0.1:{ARGS.port} -> {target} via {ARGS.proxy}")
     srv = LoopbackServer(("127.0.0.1", ARGS.port), Handler)
     try:
         srv.serve_forever()

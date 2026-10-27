@@ -1,13 +1,17 @@
-name: Upstream Linux launcher reference
+name: Linux launcher
 
 on:
   push:
     paths:
       - 'scripts/*.sh'
+      - 'relay/relay.py'
+      - 'relay/sse.py'
       - '.github/workflows/linux.yml'
   pull_request:
     paths:
       - 'scripts/*.sh'
+      - 'relay/relay.py'
+      - 'relay/sse.py'
   workflow_dispatch:
 
 permissions:

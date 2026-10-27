@@ -2,9 +2,9 @@ name: CCHost relay
 
 on:
   push:
-    paths: ['relay/**', 'scripts/cchost*.py', 'tests/**', '.github/workflows/cchost.yml']
+    paths: ['relay/**', 'scripts/cchost*.py', 'tools/analyze_log.py', 'tests/**', '.github/workflows/cchost.yml']
   pull_request:
-    paths: ['relay/**', 'scripts/cchost*.py', 'tests/**', '.github/workflows/cchost.yml']
+    paths: ['relay/**', 'scripts/cchost*.py', 'tools/analyze_log.py', 'tests/**', '.github/workflows/cchost.yml']
   workflow_dispatch:
 
 permissions:

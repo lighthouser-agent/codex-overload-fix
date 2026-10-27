@@ -170,8 +170,13 @@ class ConfigTests(unittest.TestCase):
             argv = definition["ProgramArguments"]
             self.assertEqual(argv[argv.index("--upstream") + 1], "https://cchost.ai/v1")
             self.assertEqual(argv[argv.index("--max-attempts") + 1], "10")
+            self.assertIn("--forward-late-overload", argv)
+            self.assertEqual(definition["StandardOutPath"], os.devnull)
+            self.assertTrue(definition["StandardErrorPath"].endswith("service.log"))
         with patch("cchost_service.platform.system", return_value="Linux"):
-            self.assertIn(b"cchost.ai/v1", service.service_definition(8787, "https://cchost.ai/v1", "")[2])
+            unit = service.service_definition(8787, "https://cchost.ai/v1", "")[2]
+            self.assertIn(b"cchost.ai/v1", unit)
+            self.assertIn(b"StandardOutput=null", unit)
 
 
 if __name__ == "__main__":
